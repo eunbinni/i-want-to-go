@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-1. time.app.fans epochMs로 서버 시각 동기화 (버튼 갱신 기준)
-2. 목표 직전 초 경계를 폴링해 오프셋 정밀 보정 (오차 ±10~20ms)
-3. 클릭 순간에는 네트워크를 타지 않고 로컬 단조시계로 발사
-4. CoreGraphics로 직접 마우스 이벤트
+1. time.app.fans epochMs로 서버 시각 확인 (버튼 갱신 기준)
+2. 목표 :00 직전까지 폴링 후 로컬 타이머로 정확히 :00에 클릭
+3. CoreGraphics로 직접 마우스 이벤트
 
 사용법:
   python3 iphone-click.py "2026-08-09 20:00:00"
-  python3 iphone-click.py "2026-08-09 20:00:00" --lead 0
-
-옵션:
-  --lead N   클릭을 00초보다 N ms 앞당김 (음수면 늦게, 기본 40)
 
 실행 시점의 마우스 커서 위치에 클릭합니다. 미러링 창 위에 커서를 올려둔 뒤 실행하세요.
 
@@ -84,7 +79,7 @@ def make_click(x: int, y: int):
 def open_conn() -> http.client.HTTPSConnection:
     conn = http.client.HTTPSConnection(TIME_HOST, timeout=3, context=ssl.create_default_context())
     conn.request("GET", "/", headers={"Cache-Control": "no-store"})
-    conn.getresponse().read()  # TLS 핸드셰이크와 커넥션을 미리 워밍업
+    conn.getresponse().read()
     return conn
 
 
@@ -99,47 +94,47 @@ def fetch_epoch_ms(conn: http.client.HTTPSConnection) -> tuple[int, float, float
     return epoch_ms, t0, t1 - t0
 
 
-def rough_offset(conn: http.client.HTTPSConnection) -> float:
-    """서버시간 - 로컬(monotonic) 대략적 오프셋."""
-    epoch_ms, t0, rtt = fetch_epoch_ms(conn)
-    server_ts = epoch_ms / 1000.0
-    return server_ts - (t0 + rtt)
+def server_offset(epoch_ms: int, t0: float, rtt: float) -> float:
+    """monotonic + offset ≈ time.app.fans 서버 시각(초)"""
+    return epoch_ms / 1000.0 - (t0 + rtt)
 
 
-def calibrate_boundary(conn: http.client.HTTPSConnection, deadline_mono: float) -> float | None:
-    """epochMs 초가 바뀌는 순간을 잡아 정밀 오프셋을 반환. 실패 시 None."""
-    prev_ms, prev_t0, _ = fetch_epoch_ms(conn)
-    prev_sec = prev_ms // 1000
-    while time.monotonic() < deadline_mono:
+def wait_until_near_target(conn: http.client.HTTPSConnection, target_ts: float) -> float:
+    """time.app.fans를 폴링하다 목표 :00 직전(100ms)에 offset 반환."""
+    target_ms = int(target_ts * 1000)
+    last_print = 0.0
+
+    while True:
         epoch_ms, t0, rtt = fetch_epoch_ms(conn)
-        sec = epoch_ms // 1000
-        if sec > prev_sec:
-            boundary_mono = (prev_t0 + t0) / 2 + rtt / 2
-            return sec - boundary_mono
-        prev_ms, prev_t0 = epoch_ms, t0
-        time.sleep(0.004)
-    return None
+        remain_ms = target_ms - epoch_ms
+        now = time.monotonic()
+
+        if remain_ms < -500:
+            print("목표 시각이 이미 지났습니다.")
+            sys.exit(1)
+        if remain_ms <= 100:
+            print(f"[동기화] {remain_ms / 1000:.3f}초 남음 → 로컬 타이머로 :00 클릭", flush=True)
+            return server_offset(epoch_ms, t0, rtt)
+
+        if remain_ms <= 1000 or now - last_print >= 0.5:
+            server_str = datetime.fromtimestamp(epoch_ms / 1000, KST).strftime("%H:%M:%S.%f")[:-3]
+            print(f"[폴링] {remain_ms / 1000:.2f}초 남음  서버 {server_str}  rtt {rtt * 1000:.0f}ms", flush=True)
+            last_print = now
+
+        if remain_ms > 5000:
+            time.sleep(min(1.0, (remain_ms - 3000) / 1000))
+        elif remain_ms > 1000:
+            time.sleep(0.1)
+        # 1000ms ~ 100ms: sleep 없이 연속 요청 (RTT ~20–50ms마다 1회)
 
 
 # ---------------------------------------------------------------- 메인
 
-def parse_args(argv: list[str]) -> tuple[str, int]:
+def parse_args(argv: list[str]) -> str:
     if len(argv) < 2:
         print(__doc__)
         sys.exit(1)
-
-    args = argv[1:]
-    lead_ms = 40
-    if "--lead" in args:
-        i = args.index("--lead")
-        lead_ms = int(args[i + 1])
-        args = args[:i] + args[i + 2:]
-
-    if not args:
-        print(__doc__)
-        sys.exit(1)
-
-    return args[0], lead_ms
+    return argv[1]
 
 
 def spin_until_mono(deadline: float) -> None:
@@ -156,34 +151,29 @@ def spin_until_mono(deadline: float) -> None:
 
 
 def main() -> None:
-    target_str, lead_ms = parse_args(sys.argv)
+    target_str = parse_args(sys.argv)
     x, y = current_mouse_pos()
     target_ts = datetime.strptime(target_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).timestamp()
 
     fire = make_click(x, y)
     conn = open_conn()
 
-    offset = rough_offset(conn)  # monotonic + offset ≈ 서버시간
-    remain = target_ts - (time.monotonic() + offset)
-    if remain < 3:
-        print("목표까지 3초 미만이라 정밀 보정 시간이 부족합니다. 더 일찍 실행하세요.")
+    epoch_ms, _, _ = fetch_epoch_ms(conn)
+    remain = (int(target_ts * 1000) - epoch_ms) / 1000
+    if remain < 1:
+        print("목표까지 1초 미만입니다. 더 일찍 실행하세요.")
         sys.exit(1)
-    print(f"목표까지 {remain:.1f}초. ({x}, {y}) lead {lead_ms}ms.")
+
+    print(f"목표까지 {remain:.1f}초. ({x}, {y}) time.app.fans :00에 클릭.")
     print("미러링 창을 움직이지 말고 Mac을 건드리지 마세요.")
 
-    # 목표 6초 전까지 대기 후 초 경계 정밀 측정 (경계는 매초 오므로 2초면 충분)
-    spin_until_mono(target_ts - offset - 6)
-    precise = calibrate_boundary(conn, deadline_mono=target_ts - offset - 2.5)
-    if precise is not None:
-        offset = precise
-        print(f"초 경계 정밀 보정 완료 (time.app.fans, 오차 ±10~20ms 수준)")
-    else:
-        print("경계 감지 실패, 근사 오프셋 사용 (오차 최대 ±0.5초)")
+    offset = wait_until_near_target(conn, target_ts)
     conn.close()
 
-    deadline = target_ts - offset - lead_ms / 1000.0
+    deadline = target_ts - offset
 
-    gc.disable()  # 발사 직전 GC 멈춤으로 지터 제거
+    gc.disable()
+    print("[클릭] :00 발사", flush=True)
     spin_until_mono(deadline)
     fire()
     gc.enable()
@@ -194,4 +184,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
